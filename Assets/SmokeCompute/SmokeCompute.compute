@@ -90,6 +90,8 @@ const float2 interaction_Delta;
 const float brightnessThreshold;
 const float smokeIntensityMultiplier;
 const float3 smokeColor;
+const bool continuousSmokeGeneration;
+const float smokeGenerationRate;
 
 // ---- Constants ----
 static const uint LEFT = 0;
@@ -741,7 +743,22 @@ void LoadFrameFromTexture(uint3 id : SV_DispatchThreadID)
         float smokeIntensity = normalizedBrightness * smokeIntensityMultiplier;
         float3 smokeValue = smokeColor * smokeIntensity; // 使用指定的颜色
         
-        // 设置烟雾（使用isInstantSource模式，直接设置值）
-        SmokeMap[id.xy] = float4(smokeValue, ambientTemperature);
+        // 获取当前烟雾值
+        float4 currentSmoke = SmokeMap[id.xy];
+        
+        if (continuousSmokeGeneration)
+        {
+            // 持续生成模式：持续添加烟雾，让烟雾有时间扩散和流动
+            float3 smokeAdd = smokeValue * smokeGenerationRate * deltaTime;
+            float3 newSmoke = currentSmoke.rgb + smokeAdd;
+            // 限制最大烟雾值，避免过度积累
+            newSmoke = min(newSmoke, smokeColor * smokeIntensityMultiplier * 2.0);
+            SmokeMap[id.xy] = float4(newSmoke, ambientTemperature);
+        }
+        else
+        {
+            // 直接设置模式：立即设置烟雾值（原来的方式）
+            SmokeMap[id.xy] = float4(smokeValue, ambientTemperature);
+        }
     }
 }

@@ -496,8 +496,8 @@ MonoBehaviour:
   temperatureRate: 0
   temperatureDiffusion: 0
   temperatureDecay: 0
-  smokeDiffusion: 0.05
-  smokeDecay: 0
+  smokeDiffusion: 0.08
+  smokeDecay: 0.002
   ambientTemperature: 0
   gravity: 0
   buoyancyFactor_temperature: 0
@@ -554,8 +554,10 @@ MonoBehaviour:
   playbackFrameRate: 30
   loop: 0
   brightnessThreshold: 0.5
-  smokeIntensityMultiplier: 1
-  smokeColor: {r: 0, g: 0, b: 1, a: 1}
+  smokeIntensityMultiplier: 1.65
+  smokeColor: {r: 1, g: 1, b: 1, a: 1}
+  continuousSmokeGeneration: 1
+  smokeGenerationRate: 8
   smokeManager: {fileID: 1252191725}
   hideOriginalSceneObjects: 1
   backgroundMusic: {fileID: 0}
@@ -671,6 +673,8 @@ MonoBehaviour:
   brightnessThreshold: 0.5
   smokeIntensityMultiplier: 1
   smokeColor: {r: 0, g: 0, b: 1, a: 1}
+  continuousSmokeGeneration: 1
+  smokeGenerationRate: 10
   smokeManager: {fileID: 1263401257}
   hideOriginalSceneObjects: 1
   backgroundMusic: {fileID: 0}

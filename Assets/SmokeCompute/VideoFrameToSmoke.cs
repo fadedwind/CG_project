@@ -48,6 +48,13 @@ namespace FluidSim
 		[Tooltip("烟雾颜色（RGB值，例如：蓝色=(0,0,1)，白色=(1,1,1)）")]
 		public Color smokeColor = new Color(0f, 0f, 1f, 1f); // 默认蓝色
 		
+		[Tooltip("烟雾生成模式：持续添加（推荐，更有烟雾感）或直接设置")]
+		public bool continuousSmokeGeneration = true;
+		
+		[Tooltip("烟雾生成速率（仅在持续生成模式下有效）")]
+		[Range(0f, 50f)]
+		public float smokeGenerationRate = 10f;
+		
 		[Header("引用")]
 		[Tooltip("烟雾模拟管理器")]
 		public SmokeComputeManager smokeManager;
@@ -457,8 +464,12 @@ namespace FluidSim
 			computeShader.SetFloat("brightnessThreshold", brightnessThreshold);
 			computeShader.SetFloat("smokeIntensityMultiplier", smokeIntensityMultiplier);
 			computeShader.SetVector("smokeColor", new Vector4(smokeColor.r, smokeColor.g, smokeColor.b, 1f));
+			computeShader.SetBool("continuousSmokeGeneration", continuousSmokeGeneration);
+			computeShader.SetFloat("smokeGenerationRate", smokeGenerationRate);
 			computeShader.SetInts("resolution", res.x, res.y);
 			computeShader.SetFloat("ambientTemperature", smokeManager.ambientTemperature);
+			// 确保deltaTime已设置（从SmokeComputeManager获取）
+			computeShader.SetFloat("deltaTime", smokeManager.useFixedTimeStep ? 1f / smokeManager.fixedFrameRate : Time.deltaTime);
 			
 			// 使用反射获取SmokeComputeManager的私有纹理并绑定
 			var smokeManagerType = typeof(SmokeComputeManager);

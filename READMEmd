@@ -1,0 +1,510 @@
+# 烟雾模拟项目核心技术算法实现总结
+# Smoke Simulation Project - Core Technical Algorithm Implementation Summary
+
+## 项目概述 / Project Overview
+
+这是一个基于GPU计算着色器的2D烟雾流体模拟系统，使用Unity引擎实现。项目采用经典的Stable Fluids算法，通过压力投影法求解不可压缩流体方程，实现了实时、交互式的烟雾效果。
+
+This is a GPU compute shader-based 2D smoke fluid simulation system implemented in Unity. The project uses the classic Stable Fluids algorithm, solving the incompressible fluid equations through pressure projection, achieving real-time, interactive smoke effects.
+
+---
+
+## 核心算法架构 / Core Algorithm Architecture
+
+### 1. 算法流程 / Algorithm Pipeline
+
+模拟每帧执行以下步骤（在`SmokeComputeManager.RunSim()`中定义）：
+
+The simulation executes the following steps each frame (defined in `SmokeComputeManager.RunSim()`):
+
+```195:218:Assets/SmokeCompute/SmokeComputeManager.cs
+void RunSim()
+{
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.ExternalForces);
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.Buoyancy);
+
+	// Player input
+	RunInteractionKernel();
+
+	// Update map of which cell edges border an obstacle cell (needs updating since user input can alter)
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.UpdateObstacleMap);
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.UpdateObstacleEdges);
+
+	RunPressureSolveCompute();
+
+	// Update velocities from pressure
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.VelocityPressureUpdate);
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.Debug_UpdateDivergenceDisplay);
+
+	// Advection
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.SmokeAdvection);
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.SmokeDiffusionAndReadback);
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.VelocitySelfAdvection);
+	ComputeHelper.Dispatch(compute, resolution.x, resolution.y, Kernel.AdvectedVelocityReadback);
+}
+```
+
+**步骤说明 / Step Description:**
+
+1. **外力应用 / External Forces**: 应用外部力（如风、用户交互）
+2. **浮力计算 / Buoyancy**: 基于温度和烟雾浓度计算浮力
+3. **障碍物更新 / Obstacle Update**: 更新障碍物地图和边缘信息
+4. **压力求解 / Pressure Solve**: 求解压力场以确保速度场无散度
+5. **速度更新 / Velocity Update**: 用压力梯度更新速度
+6. **平流 / Advection**: 使用半拉格朗日方法平流烟雾和速度场
+7. **扩散 / Diffusion**: 应用扩散和衰减
+
+---
+
+## 核心技术实现 / Core Technical Implementation
+
+### 2. 压力投影法 (Pressure Projection Method)
+
+**中文说明：**
+压力投影法是Stable Fluids算法的核心，用于确保速度场满足不可压缩条件（∇·v = 0）。通过求解泊松方程来修正速度场。
+
+**English:**
+Pressure projection is the core of the Stable Fluids algorithm, ensuring the velocity field satisfies the incompressibility condition (∇·v = 0). It corrects the velocity field by solving the Poisson equation.
+
+**实现位置 / Implementation Location:**
+- 准备阶段：`PreparePressureSolver` kernel (```522:551:Assets/SmokeCompute/SmokeCompute.compute```)
+- 求解阶段：`PressureSolve_RedBlack` kernel (```553:580:Assets/SmokeCompute/SmokeCompute.compute```)
+
+**关键代码 / Key Code:**
+
+```522:551:Assets/SmokeCompute/SmokeCompute.compute
+[numthreads(8,8,1)]
+void PreparePressureSolver(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    // Figure out which edges fluid can flow across
+    int isSolidCell = IsSolidCell(id.x, id.y);
+    int flowTop = 1 - (isSolidCell | IsSolidCell(id.x, id.y + 1));
+    int flowLeft = 1 - (isSolidCell | IsSolidCell(id.x - 1, id.y));
+    int flowRight = 1 - (isSolidCell | IsSolidCell(id.x + 1, id.y));
+    int flowBottom = 1 - (isSolidCell | IsSolidCell(id.x, id.y - 1));
+    // Pack edges permitting flow into 4bit integer
+    int packedEdgeFlow = flowLeft << LEFT | flowRight << RIGHT | flowBottom << BOTTOM | flowTop << TOP;
+
+    // Compute velocity term of pressure calculation
+    float velTop = VelocityMap[ClampCoord(id.x, id.y + 1)].y;
+    float velRight = VelocityMap[ClampCoord(id.x + 1, id.y)].x;
+    float velBottom = VelocityMap[id.xy].y;
+    float velLeft = VelocityMap[id.xy].x;
+
+    float velocityTerm;
+    int edgeFlowCount = flowTop + flowBottom + flowLeft + flowRight;
+
+    if (edgeFlowCount == 0) velocityTerm = 0;
+    else velocityTerm = (velRight - velLeft + velTop - velBottom) / (edgeFlowCount * K);
+
+    // Store:
+    PressureSolveData[id.xy] = float2(velocityTerm, packedEdgeFlow); // Precomputed solve data
+    if (clearPressure) PressureMap[id.xy] = 0; // Initial pressure
+}
+```
+
+**数学原理 / Mathematical Principle:**
+- 求解方程：∇²p = ∇·v / Δt
+- 其中 p 是压力，v 是速度场，Δt 是时间步长
+- 求解后更新速度：v_new = v_old - Δt·∇p
+
+---
+
+### 3. 红黑高斯-赛德尔迭代 (Red-Black Gauss-Seidel Iteration)
+
+**中文说明：**
+使用红黑棋盘模式的高斯-赛德尔迭代法求解压力场，这种模式允许并行计算，提高GPU利用率。
+
+**English:**
+Uses a red-black checkerboard pattern Gauss-Seidel iteration to solve the pressure field. This pattern allows parallel computation, improving GPU utilization.
+
+**实现位置 / Implementation Location:**
+```553:580:Assets/SmokeCompute/SmokeCompute.compute
+[numthreads(64,1,1)]
+void PressureSolve_RedBlack(uint3 threadIndex : SV_DispatchThreadID)
+{
+    if (threadIndex.x >= halfCellCount) return;
+
+    uint2 cell = CheckerboardCoord(threadIndex.x, passIndex, resolution);
+    // Unpack precomputed data
+    float velocityTerm = PressureSolveData[cell].r;
+    int edgeFlowCase = (int)PressureSolveData[cell].g;
+    int flowTop = (edgeFlowCase >> TOP) & 1;
+    int flowLeft = (edgeFlowCase >> LEFT) & 1;
+    int flowRight = (edgeFlowCase >> RIGHT) & 1;
+    int flowBottom = (edgeFlowCase >> BOTTOM) & 1;
+    int edgeFlowCount = flowTop + flowBottom + flowLeft + flowRight;
+    if (edgeFlowCount == 0) return;
+
+    // Solve pressure
+    float pressureTop = GetPressure(cell.x, cell.y + 1) * flowTop;
+    float pressureLeft = GetPressure(cell.x - 1, cell.y) * flowLeft;
+    float pressureRight = GetPressure(cell.x + 1, cell.y) * flowRight;
+    float pressureBottom = GetPressure(cell.x, cell.y - 1) * flowBottom;
+    float pressureTerm = (pressureLeft + pressureRight + pressureBottom + pressureTop) / edgeFlowCount;
+    float pressureNew = pressureTerm - velocityTerm;
+
+    // Successive over-relaxation
+    float pressureOld = PressureMap[cell];
+    PressureMap[cell] = pressureOld + (pressureNew - pressureOld) * weightSOR;
+}
+```
+
+**关键特性 / Key Features:**
+- **棋盘模式 / Checkerboard Pattern**: 将网格分为红黑两色，交替更新
+- **超松弛 / SOR (Successive Over-Relaxation)**: 使用权重因子（默认1.7）加速收敛
+- **迭代次数 / Iterations**: 默认40次迭代（可配置）
+
+---
+
+### 4. 半拉格朗日平流 (Semi-Lagrangian Advection)
+
+**中文说明：**
+使用半拉格朗日方法平流烟雾和速度场。通过反向追踪粒子轨迹，从上一时刻的位置采样数据。
+
+**English:**
+Uses the semi-Lagrangian method to advect smoke and velocity fields. It samples data from previous time positions by backward-tracing particle trajectories.
+
+**实现位置 / Implementation Location:**
+
+**烟雾平流 / Smoke Advection:**
+```662:671:Assets/SmokeCompute/SmokeCompute.compute
+[numthreads(8,8,1)]
+void SmokeAdvection(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float2 worldPos = CellCentreFromCoord(id.x, id.y);
+    float2 posOld = RewindPos(worldPos);
+    float4 smokeAtPosPrev = GetSmokeAtWorldPos(posOld);
+    SmokeMapAdvected[id.xy] = smokeAtPosPrev;
+}
+```
+
+**速度自平流 / Velocity Self-Advection:**
+```618:652:Assets/SmokeCompute/SmokeCompute.compute
+[numthreads(8,8,1)]
+void VelocitySelfAdvection(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+
+    int obstacleEdgeCase = (int)ObstacleMap[id.xy].g;
+    int obstacleLeft = (obstacleEdgeCase >> LEFT) & 1;
+    int obstacleBottom = (obstacleEdgeCase >> BOTTOM) & 1;
+
+    float2 velAdvected = 0;
+
+    if (!obstacleLeft)
+    {
+        float2 pos = CellEdgeLeft(id.x, id.y);
+        float2 posOld = RewindPos(pos);
+        velAdvected.x = GetVelocityAtWorldPos(posOld).x;
+    }
+    else
+    {
+        velAdvected.x = VelocityMapSample[id.xy].x;
+    }
+    if (!obstacleBottom)
+    {
+        float2 pos = CellEdgeBottom(id.x, id.y);
+        float2 posOld = RewindPos(pos);
+        velAdvected.y = GetVelocityAtWorldPos(posOld).y;
+    }
+    else
+    {
+        velAdvected.y = VelocityMapSample[id.xy].y;
+    }
+
+    VelocityMapAdvected[id.xy] = velAdvected;
+}
+```
+
+**反向追踪函数 / Rewind Function:**
+```304:309:Assets/SmokeCompute/SmokeCompute.compute
+float2 RewindPos(float2 worldPos)
+{
+    float2 velocity = GetVelocityAtWorldPos(worldPos);
+    float2 posOld = worldPos - velocity * deltaTime;
+    return posOld;
+}
+```
+
+**数学原理 / Mathematical Principle:**
+- 平流方程：∂q/∂t + v·∇q = 0
+- 半拉格朗日解：q(x, t+Δt) = q(x - v·Δt, t)
+- 使用双线性插值采样非网格位置的值
+
+---
+
+### 5. 浮力计算 (Buoyancy Calculation)
+
+**中文说明：**
+基于温度和烟雾浓度计算浮力。热空气上升，浓烟雾下沉，模拟真实的物理行为。
+
+**English:**
+Calculates buoyancy based on temperature and smoke concentration. Hot air rises, dense smoke sinks, simulating realistic physical behavior.
+
+**实现位置 / Implementation Location:**
+```497:520:Assets/SmokeCompute/SmokeCompute.compute
+[numthreads(8,8,1)]
+void Buoyancy(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= resolution)) return;
+
+    int obstacleEdgeCase = (int)ObstacleMap[id.xy].g;
+    int obstacleS = (obstacleEdgeCase >> BOTTOM) & 1;
+
+    //return;
+    float2 cellBottomEdge = CellEdgeBottom(id.x, id.y);
+    float4 smokeData = GetSmokeAtWorldPos(cellBottomEdge);
+
+    // Hot air rises
+    float temperature = smokeData.a;
+    float relativeTemperature = temperature - ambientTemperature;
+    float buoyancyForceTemperature = -buoyancyFactor_temperature * relativeTemperature * gravity;
+
+    // Heavy smoke sinks
+    float3 smoke = smokeData.rgb;
+    float smokeConcentration = dot(smoke, 1) / 3;
+    float buoyancyForceSmoke = buoyancyFactor_smoke * smokeConcentration * gravity;
+
+    VelocityMap[id.xy] += float2(0, buoyancyForceTemperature + buoyancyForceSmoke) * deltaTime * (1 - obstacleS);
+}
+```
+
+**物理模型 / Physical Model:**
+- **温度浮力 / Temperature Buoyancy**: F_temp = -α·(T - T_ambient)·g
+- **烟雾浮力 / Smoke Buoyancy**: F_smoke = β·C_smoke·g
+- 其中 α, β 是可调参数，g 是重力加速度
+
+---
+
+### 6. 扩散与衰减 (Diffusion and Decay)
+
+**中文说明：**
+使用拉普拉斯算子实现扩散，模拟烟雾的扩散和温度传导。同时应用指数衰减模拟能量损失。
+
+**English:**
+Uses the Laplacian operator for diffusion, simulating smoke spreading and temperature conduction. Also applies exponential decay to simulate energy loss.
+
+**实现位置 / Implementation Location:**
+```673:695:Assets/SmokeCompute/SmokeCompute.compute
+[numthreads(8,8,1)]
+void SmokeDiffusionAndReadback(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+
+    float4 centre = GetAdvectedSmokeData(id.x, id.y);
+    float4 left = GetAdvectedSmokeData(id.x - 1, id.y);
+    float4 right = GetAdvectedSmokeData(id.x + 1, id.y);
+    float4 top = GetAdvectedSmokeData(id.x, id.y + 1);
+    float4 bottom = GetAdvectedSmokeData(id.x, id.y - 1);
+
+    float4 laplacian = ((left + right + top + bottom) - 4 * centre) / (cellSize * cellSize);
+
+    // Temperature diffusion and decay
+    float temperatureNew = centre.a + temperatureDiffusion * deltaTime * laplacian.a;
+    temperatureNew *= exp(-deltaTime * temperatureDecay);
+
+    // Smoke diffusion and decay
+    float3 smokeNew = centre.rgb + smokeDiffusion * deltaTime * laplacian.rgb;
+    smokeNew *= exp(-deltaTime * smokeDecay);
+
+    SmokeMap[id.xy] = float4(smokeNew, temperatureNew);
+}
+```
+
+**数学公式 / Mathematical Formula:**
+- **扩散 / Diffusion**: ∂q/∂t = ν·∇²q
+- **衰减 / Decay**: q(t+Δt) = q(t)·e^(-λ·Δt)
+- 其中 ν 是扩散系数，λ 是衰减率
+
+---
+
+### 7. 障碍物处理 (Obstacle Handling)
+
+**中文说明：**
+系统支持动态障碍物，通过障碍物地图标记固体单元格，并在压力求解和速度更新时考虑边界条件。
+
+**English:**
+The system supports dynamic obstacles, marking solid cells through an obstacle map, and considering boundary conditions during pressure solving and velocity updates.
+
+**实现位置 / Implementation Location:**
+- 障碍物地图更新：`UpdateObstacleMap` (```343:379:Assets/SmokeCompute/SmokeCompute.compute```)
+- 边缘信息更新：`UpdateObstacleEdges` (```381:394:Assets/SmokeCompute/SmokeCompute.compute```)
+
+**关键特性 / Key Features:**
+- **边缘标记 / Edge Marking**: 使用位掩码标记哪些边缘与障碍物相邻
+- **边界条件 / Boundary Conditions**: 在障碍物边界处速度为零（无滑移条件）
+- **动态更新 / Dynamic Update**: 支持运行时修改障碍物
+
+---
+
+### 8. 视频帧到烟雾转换 (Video Frame to Smoke Conversion)
+
+**中文说明：**
+项目支持从视频帧序列生成烟雾效果。通过分析帧的亮度，将暗色区域标记为障碍物，亮色区域作为烟雾源。
+
+**English:**
+The project supports generating smoke effects from video frame sequences. By analyzing frame brightness, dark areas are marked as obstacles, and bright areas serve as smoke sources.
+
+**实现位置 / Implementation Location:**
+```712:764:Assets/SmokeCompute/SmokeCompute.compute
+// 从输入纹理加载帧数据，设置障碍物和烟雾
+[numthreads(8,8,1)]
+void LoadFrameFromTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= resolution.x || id.y >= resolution.y) return;
+    
+    // 计算UV坐标（注意Unity纹理坐标原点在左下角）
+    float2 uv = float2((float)id.x / resolution.x, (float)id.y / resolution.y);
+    
+    // 从输入纹理采样（如果纹理大小不匹配，会自动插值）
+    float4 frameColor = InputFrameTexture.SampleLevel(samplerInputFrameTexture, uv, 0);
+    
+    // 计算亮度（使用灰度值）
+    float brightness = dot(frameColor.rgb, float3(0.299, 0.587, 0.114));
+    
+    // 根据亮度阈值决定是障碍物还是烟雾源
+    // 亮色区域（如白色）= 烟雾源，暗色区域（如黑色）= 障碍物
+    
+    if (brightness < brightnessThreshold)
+    {
+        // 暗色区域 = 障碍物
+        ObstacleMap[id.xy] = float2(1.0, 0); // r通道 > 0 表示障碍物
+        // 清除该位置的烟雾
+        SmokeMap[id.xy] = float4(0, 0, 0, ambientTemperature);
+    }
+    else
+    {
+        // 亮色区域 = 烟雾源
+        ObstacleMap[id.xy] = float2(0, 0); // 不是障碍物
+        
+        // 根据亮度设置烟雾强度（亮度越高，烟雾越多）
+        float normalizedBrightness = (brightness - brightnessThreshold) / (1.0 - brightnessThreshold);
+        float smokeIntensity = normalizedBrightness * smokeIntensityMultiplier;
+        float3 smokeValue = smokeColor * smokeIntensity; // 使用指定的颜色
+        
+        // 获取当前烟雾值
+        float4 currentSmoke = SmokeMap[id.xy];
+        
+        if (continuousSmokeGeneration)
+        {
+            // 持续生成模式：持续添加烟雾，让烟雾有时间扩散和流动
+            float3 smokeAdd = smokeValue * smokeGenerationRate * deltaTime;
+            float3 newSmoke = currentSmoke.rgb + smokeAdd;
+            // 限制最大烟雾值，避免过度积累
+            newSmoke = min(newSmoke, smokeColor * smokeIntensityMultiplier * 2.0);
+            SmokeMap[id.xy] = float4(newSmoke, ambientTemperature);
+        }
+        else
+        {
+            // 直接设置模式：立即设置烟雾值（原来的方式）
+            SmokeMap[id.xy] = float4(smokeValue, ambientTemperature);
+        }
+    }
+}
+```
+
+**处理流程 / Processing Flow:**
+1. 加载视频帧序列（通过`VideoFrameToSmoke`组件）
+2. 计算每个像素的亮度
+3. 根据阈值分类：暗色→障碍物，亮色→烟雾源
+4. 将帧数据传递给Compute Shader处理
+5. 实时更新障碍物地图和烟雾地图
+
+---
+
+## 数据结构 / Data Structures
+
+### 主要纹理 / Main Textures
+
+1. **VelocityMap** (R32G32B32A32_SFloat): 存储速度场（x, y分量）
+2. **VelocityMapAdvected**: 平流后的速度场
+3. **SmokeMap** (R32G32B32A32_SFloat): RGB=烟雾浓度，A=温度
+4. **SmokeMapAdvected**: 平流后的烟雾数据
+5. **PressureMap** (R_SFloat): 压力场
+6. **ObstacleMap** (R32G32B32A32_SFloat): R=障碍物标志，G=边缘信息
+7. **PressureSolveData** (RG_SFloat): 压力求解的预计算数据
+
+### 场景元素 / Scene Elements
+
+```374:385:Assets/SmokeCompute/SmokeComputeManager.cs
+public struct SceneElement
+{
+	public int shapeType;
+	public int isObstacle;
+	public int isInstantSource; // smoke is set directly to the smoke value, rather added over time
+	public Vector2 pos;
+	public Vector2 posLineEnd;
+	public Vector2 size;
+	public Vector2 velocitySource;
+	public Vector3 smokeRate;
+	public float targetTemperature;
+}
+```
+
+---
+
+## 性能优化 / Performance Optimization
+
+1. **GPU并行计算 / GPU Parallel Computing**: 所有计算在GPU上并行执行
+2. **红黑迭代 / Red-Black Iteration**: 提高压力求解的并行度
+3. **纹理格式优化 / Texture Format Optimization**: 使用合适的纹理格式减少内存占用
+4. **双缓冲 / Double Buffering**: 使用临时纹理避免读写冲突
+5. **可配置迭代次数 / Configurable Iterations**: 平衡精度和性能
+
+---
+
+## 技术特点总结 / Technical Features Summary
+
+### 中文 / Chinese
+
+1. **基于Stable Fluids算法**: 经典的流体模拟方法，稳定可靠
+2. **GPU加速**: 使用Compute Shader实现高性能实时模拟
+3. **交互式控制**: 支持鼠标交互添加速度和烟雾
+4. **动态障碍物**: 支持运行时修改障碍物配置
+5. **多种显示模式**: 烟雾、温度、速度、压力、散度等可视化
+6. **视频帧集成**: 支持从视频帧生成烟雾效果
+7. **物理准确性**: 包含浮力、扩散、衰减等物理效应
+
+### English
+
+1. **Stable Fluids Algorithm**: Classic fluid simulation method, stable and reliable
+2. **GPU Acceleration**: High-performance real-time simulation using Compute Shaders
+3. **Interactive Control**: Supports mouse interaction to add velocity and smoke
+4. **Dynamic Obstacles**: Supports runtime modification of obstacle configuration
+5. **Multiple Display Modes**: Visualization of smoke, temperature, velocity, pressure, divergence, etc.
+6. **Video Frame Integration**: Supports generating smoke effects from video frames
+7. **Physical Accuracy**: Includes buoyancy, diffusion, decay, and other physical effects
+
+---
+
+## 参考文献 / References
+
+- Jos Stam, "Stable Fluids", SIGGRAPH 1999
+- Robert Bridson, "Fluid Simulation for Computer Graphics", 2015
+- GPU Gems Chapter 38: "Fast Fluid Dynamics Simulation on the GPU"
+
+---
+
+## 项目文件结构 / Project File Structure
+
+```
+Assets/SmokeCompute/
+├── SmokeComputeManager.cs      # 主管理器，控制模拟流程
+├── SmokeCompute.compute        # GPU计算着色器，核心算法实现
+├── SmokeDisplay.shader         # 显示着色器，可视化渲染
+├── VideoFrameToSmoke.cs        # 视频帧到烟雾转换组件
+└── SceneObject.cs              # 场景元素（障碍物、发射器等）
+```
+
+---
+
+*本文档总结了烟雾模拟项目的核心技术算法实现，包括压力投影、红黑迭代、半拉格朗日平流等关键技术的详细说明。*
+
+*This document summarizes the core technical algorithm implementation of the smoke simulation project, including detailed explanations of key technologies such as pressure projection, red-black iteration, and semi-Lagrangian advection.*
+
